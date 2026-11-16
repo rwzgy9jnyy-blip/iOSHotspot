@@ -29,6 +29,32 @@ static inline BOOL IHVPNStartupConfigured(NSDictionary *diagnostic,NSString *non
   (!ipv6||[diagnostic[@"raConfigurationReady"] isEqual:@YES]);
 }
 
+// 挂起进程属于整个会话；重试只清除本次配置确认，不能丢失仍需释放的PID。
+// 返回独立快照，写入失败时调用方可以保留之前已持久化的诊断。
+static inline NSMutableDictionary *IHVPNStartupDiagnosticForAttempt(NSDictionary *previous,NSDictionary *session,NSNumber *heldRAPID) {
+ BOOL sameNonce=[previous[@"nonce"] isEqual:session[@"nonce"]];
+ BOOL sameAttempt=sameNonce&&[previous[@"startupAttempt"] isEqual:session[@"startupAttempt"]];
+ NSMutableDictionary *current=sameAttempt?[previous mutableCopy]:[NSMutableDictionary new];
+ if(!sameAttempt){
+  current[@"nonce"]=session[@"nonce"];current[@"startupAttempt"]=session[@"startupAttempt"];
+  current[@"heldRA"]=sameNonce?(previous[@"heldRA"]?:@[]):@[];
+  if(sameNonce&&previous[@"vpnUpstreamPrepared"])current[@"vpnUpstreamPrepared"]=previous[@"vpnUpstreamPrepared"];
+  if(previous[@"missingLegacySymbols"])current[@"missingLegacySymbols"]=previous[@"missingLegacySymbols"];
+ }
+ if(heldRAPID){
+  NSMutableArray *pids=[(current[@"heldRA"]?:@[]) mutableCopy];
+  if(![pids containsObject:heldRAPID])[pids addObject:heldRAPID];
+  current[@"heldRA"]=pids;
+ }
+ return current;
+}
+
+// 内存只保留已成功发布的快照，失败的RA确认不能在之后的NAT写入中复活。
+static inline BOOL IHVPNStartupPublishDiagnostic(NSMutableDictionary *diagnostic,NSDictionary *candidate,BOOL (^writer)(NSDictionary *)) {
+ if(!writer(candidate))return NO;
+ [diagnostic setDictionary:candidate];return YES;
+}
+
 // 两类确认都进入关闭→稳定→开启；准备确认本身从不放行流量。
 static inline NSString *IHVPNStartupRestartReason(NSDictionary *misd,NSArray<NSDictionary*> *sources,NSString *nonce,
  NSTimeInterval requestedAt,NSUInteger retries,BOOL upstreamRetried,BOOL settled) {

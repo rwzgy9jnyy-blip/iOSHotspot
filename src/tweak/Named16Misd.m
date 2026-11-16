@@ -1,4 +1,5 @@
 #import "../common/IHNamedVPN16.h"
+#import "../common/IHVPNStartup.h"
 #import "WiFiPrefix.h"
 #include <xpc/xpc.h>
 #include <sys/ioctl.h>
@@ -94,22 +95,19 @@ static BOOL updateDiagnostic(NSDictionary *session,NSDictionary *values){
   if(session){
    // 异步PF/RA回调不得把上一轮无线启动的就绪确认写入当前尝试。
    if(!IHNativeStartupAttemptMatches(session,IHNativeReadJSON(IHNativeStatePath)))return NO;
-   BOOL sameNonce=[diagnostic[@"nonce"] isEqual:session[@"nonce"]],sameAttempt=sameNonce&&[diagnostic[@"startupAttempt"] isEqual:session[@"startupAttempt"]];
+   BOOL sameAttempt=[diagnostic[@"nonce"] isEqual:session[@"nonce"]]&&[diagnostic[@"startupAttempt"] isEqual:session[@"startupAttempt"]];
    if(sameAttempt){BOOL changed=NO;for(NSString *key in values)if(![diagnostic[key] isEqual:values[key]]){changed=YES;break;}if(!changed)return YES;}
-   else{
-    id prepared=sameNonce?diagnostic[@"vpnUpstreamPrepared"]:nil,missing=diagnostic[@"missingLegacySymbols"];
-    [diagnostic removeAllObjects];diagnostic[@"nonce"]=session[@"nonce"];diagnostic[@"startupAttempt"]=session[@"startupAttempt"];diagnostic[@"heldRA"]=@[];
-    // 上游准备属于会话；NAT、RA及网桥确认必须由新一次启动重新产生。
-    if(prepared)diagnostic[@"vpnUpstreamPrepared"]=prepared;if(missing)diagnostic[@"missingLegacySymbols"]=missing;
-   }
   }
-  [diagnostic addEntriesFromDictionary:values];diagnostic[@"build"]=IH16Backend;diagnostic[@"packageVersion"]=@(IH_BUILD_VERSION);diagnostic[@"sourcePolicyBuild"]=@(IHSourcePolicyBuild);diagnostic[@"ready"]=@(ready);diagnostic[@"legacyHooksReady"]=@(ready);diagnostic[@"familyGuardReady"]=@(familyGuardReady);diagnostic[@"vpnUpstreamReady"]=@(vpnUpstreamReady);diagnostic[@"wifiPrefixReady"]=@(IHWiFiPrefixIsReady());diagnostic[@"vpnIPv6PolicyVersion"]=@1;diagnostic[@"pid"]=@(getpid());diagnostic[@"time"]=@(NSDate.date.timeIntervalSince1970);BOOL written=IHNativeWriteRuntimeJSON(IH16MisdState,diagnostic);if(written)notify_post(IH16ReadyNotification);return written;
+  NSMutableDictionary *candidate=session?IHVPNStartupDiagnosticForAttempt(diagnostic,session,nil):[diagnostic mutableCopy];
+  [candidate addEntriesFromDictionary:values];candidate[@"build"]=IH16Backend;candidate[@"packageVersion"]=@(IH_BUILD_VERSION);candidate[@"sourcePolicyBuild"]=@(IHSourcePolicyBuild);candidate[@"ready"]=@(ready);candidate[@"legacyHooksReady"]=@(ready);candidate[@"familyGuardReady"]=@(familyGuardReady);candidate[@"vpnUpstreamReady"]=@(vpnUpstreamReady);candidate[@"wifiPrefixReady"]=@(IHWiFiPrefixIsReady());candidate[@"vpnIPv6PolicyVersion"]=@1;candidate[@"pid"]=@(getpid());candidate[@"time"]=@(NSDate.date.timeIntervalSince1970);
+  BOOL written=IHVPNStartupPublishDiagnostic(diagnostic,candidate,^BOOL(NSDictionary *value){return IHNativeWriteRuntimeJSON(IH16MisdState,value);});
+  if(written)notify_post(IH16ReadyNotification);return written;
  }
 }
 // VPN上游不依赖蜂窝认证；只在本轮授权、隧道地址/DNS及路由全部匹配时适配。
 static void convertVPNStatus(id object,SEL selector,void *status,id rawStatus){
  NSDictionary *session=IHNativeFamilyPolicySession();
- BOOL active=status&&rawStatus&&IHNativeProcess([session[@"parentPID"] intValue],"ioshotspotd")&&IH16IdentityMatches(session[@"binding"])&&IH16RoutesMatch(session[@"binding"]);
+ BOOL active=status&&rawStatus&&IHNativeSessionAuthorizationMatches(session,IHNativeReadJSON(IHSourceRuntimePath))&&IHNativeProcess([session[@"parentPID"] intValue],"ioshotspotd")&&IH16IdentityMatches(session[@"binding"])&&IH16RoutesMatch(session[@"binding"]);
  if(!active){originalConvertStatus(object,selector,status,rawStatus);return;}
  // 只改传给系统转换方法的副本，属性读写全部经过具名方法。
  id copy=[rawStatus copy],availability=[NSClassFromString(@"CTDataConnectionAvailabilityStatus") new],connection=[NSClassFromString(@"CTDataConnectionStatus") new];
@@ -126,7 +124,7 @@ static void convertVPNStatus(id object,SEL selector,void *status,id rawStatus){
  // 回到当前系统队列更新misd的共享快照；不调用蜂窝激活，不修改CoreTelephony状态。
  dispatch_async(dispatch_get_current_queue(),^{@autoreleasepool{
   NSDictionary *current=IHNativeFamilyPolicySession();
-  if(![current[@"nonce"] isEqual:nonce]||!IH16IdentityMatches(current[@"binding"])||!IH16RoutesMatch(current[@"binding"])){
+  if(![current[@"nonce"] isEqual:nonce]||!IHNativeSessionAuthorizationMatches(current,IHNativeReadJSON(IHSourceRuntimePath))||!IH16IdentityMatches(current[@"binding"])||!IH16RoutesMatch(current[@"binding"])){
    // 暂时失配只取消本轮准备；后续真实CT事件可重试，不清除其他nonce。
    @synchronized(preparedUpstreams){[preparedUpstreams removeObject:nonce];}
    return;
@@ -228,9 +226,8 @@ static int spawnProcess(pid_t *pid,const char *path,const posix_spawn_file_actio
  if(owned)posix_spawnattr_destroy(&own);
  if(!code&&pid){
   BOOL tracked=NO;@synchronized(diagnostic){
-   BOOL sameAttempt=[diagnostic[@"nonce"] isEqual:session[@"nonce"]]&&[diagnostic[@"startupAttempt"] isEqual:session[@"startupAttempt"]];
-   NSMutableArray *pids=[(sameAttempt?(diagnostic[@"heldRA"]?:@[]):@[]) mutableCopy];[pids addObject:@(*pid)];
-   tracked=updateDiagnostic(session,@{@"heldRA":pids,@"raConfigurationReady":@YES});
+   NSDictionary *candidate=IHVPNStartupDiagnosticForAttempt(diagnostic,session,@(*pid));
+   tracked=updateDiagnostic(session,@{@"heldRA":candidate[@"heldRA"],@"raConfigurationReady":@YES});
   }
   // 过期或无法记录的挂起子进程不能遗留；只结束本次刚派生的rtadvd。
   if((!tracked||!IHNativeStartupAttemptMatches(session,IHNativeReadJSON(IHNativeStatePath)))&&IHNativeProcess(*pid,"rtadvd")){kill(*pid,SIGTERM);kill(*pid,SIGCONT);}

@@ -82,7 +82,9 @@
    strong->_pid=0;
    // 先清理旧监听，再通知服务；回调可能立即启动下一轮，不能取消新监听。
    if(strong->_exitWatch){dispatch_source_cancel(strong->_exitWatch);strong->_exitWatch=nil;}
-   IHNativeSetForwarding(AF_INET,0);IHNativeSetForwarding(AF_INET6,0);if(strong.changed)strong.changed();
+   NSDictionary *journal=IHNativeReadJSON(IHNativeJournalPath);
+   if([journal[@"backend"] isEqual:IH16Backend]){IHNativeSetForwarding(AF_INET,0);IHNativeSetForwarding(AF_INET6,0);}
+   if(strong.changed)strong.changed();
   }
  });dispatch_resume(_exitWatch);return YES;
 }

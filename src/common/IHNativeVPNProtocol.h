@@ -29,6 +29,16 @@ static BOOL IHNativeBindingMatches(NSDictionary *expected,NSDictionary *current,
  for(NSString *key in @[@"interface",@"interfaceIndex",@"serviceID",@"ipv4addresses",@"dnsServers"])if(![expected[key] isEqual:current[key]])return NO;
  return YES;
 }
+// 停止时保留nonce供收尾门控使用；开启许可和绑定才是继续工作的授权。
+static BOOL IHNativeSessionAuthorizationMatches(NSDictionary *session,NSDictionary *runtime){
+ NSString *nonce=session[@"nonce"];NSDictionary *binding=session[@"binding"],*authorized=runtime[@"vpnBinding"];
+ if(![nonce isKindOfClass:NSString.class]||!nonce.length||
+    ![binding isKindOfClass:NSDictionary.class]||![authorized isKindOfClass:NSDictionary.class])return NO;
+ BOOL ipv6=IHNativeIPv6Enabled(session);
+ return [runtime[@"enabled"] isEqual:@YES]&&[runtime[@"source"] isEqual:@"vpn"]&&
+  [runtime[@"nativeSession"] isEqual:nonce]&&[runtime[@"allowLegacyStart"] isEqual:@YES]&&
+  IHNativeIPv6Enabled(runtime)==ipv6&&IHNativeBindingMatches(binding,authorized,ipv6);
+}
 
 static BOOL IHNativeInterfaceName(NSString *name){
  if(![name isKindOfClass:NSString.class]||!name.length||name.length>=IFNAMSIZ)return NO;

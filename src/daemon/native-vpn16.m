@@ -33,7 +33,7 @@ static int readinessToken=-1;
 static SCDynamicStoreRef store,controlStore;
 static int routeFD=-1,baseline4,baseline6;
 static _Atomic bool ending=false,gateOpen=false,controlActive=false;
-static NSDate *startedAt,*pausedAt;
+static NSDate *pausedAt;
 static BOOL started;
 static NSUInteger startupRetries;
 static NSDictionary *authorizationFailure,*validationFailure;
@@ -45,8 +45,9 @@ static void blockForwarding(void){IHNativeSetForwarding(AF_INET,0);IHNativeSetFo
 static BOOL ownerValid(void){
  NSDictionary *readFailure=nil,*runtime=IHNativeReadJSONChecked(IHSourceRuntimePath,&readFailure);
  BOOL parent=IHNativeProcess([session[@"parentPID"] intValue],"ioshotspotd");
- BOOL valid=!atomic_load(&ending)&&parent&&[runtime[@"enabled"] boolValue]&&[runtime[@"source"] isEqual:@"vpn"]&&[runtime[@"nativeSession"] isEqual:session[@"nonce"]]&&IHNativeIPv6Enabled(runtime)==IHNativeIPv6Enabled(session);
- if(!valid&&!atomic_load(&ending))authorizationFailure=@{@"parentAlive":@(parent),@"runtimeRead":@(runtime!=nil),@"readFailure":readFailure?:@{},@"enabled":runtime[@"enabled"]?:@NO,@"source":runtime[@"source"]?:@"",@"runtimeNonce":runtime[@"nativeSession"]?:@"",@"sessionNonce":session[@"nonce"]?:@"",@"runtimeIPv6":@(IHNativeIPv6Enabled(runtime)),@"sessionIPv6":@(IHNativeIPv6Enabled(session))};
+ BOOL authorized=IHNativeSessionAuthorizationMatches(session,runtime);
+ BOOL valid=!atomic_load(&ending)&&parent&&authorized;
+ if(!valid&&!atomic_load(&ending))authorizationFailure=@{@"parentAlive":@(parent),@"runtimeRead":@(runtime!=nil),@"readFailure":readFailure?:@{},@"enabled":runtime[@"enabled"]?:@NO,@"source":runtime[@"source"]?:@"",@"runtimeNonce":runtime[@"nativeSession"]?:@"",@"sessionNonce":session[@"nonce"]?:@"",@"runtimeIPv6":@(IHNativeIPv6Enabled(runtime)),@"sessionIPv6":@(IHNativeIPv6Enabled(session)),@"allowLegacyStart":runtime[@"allowLegacyStart"]?:@NO,@"bindingAuthorized":@(authorized)};
  return valid;
 }
 static BOOL validVPN(void){
@@ -77,7 +78,9 @@ static void checkVPN(void){
  if(atomic_load(&ending))return;
  if(!IHNativeIPv6Enabled(session)&&IHKernelForwarding(AF_INET6)!=0){requestStop(@"IPv6转发状态异常，已阻断共享。");return;}
  if(validVPN()){
-  if(started&&IHNativeIPv6Enabled(session)&&!ensureIPv6Gateways()){requestStop(@"无法维护本轮IPv6网关，已关闭共享。");return;}
+  // 首次放行由启动流程确认NAT、RA及网桥；事件回调只能恢复已启动的会话。
+  if(!started)return;
+  if(IHNativeIPv6Enabled(session)&&!ensureIPv6Gateways()){requestStop(@"无法维护本轮IPv6网关，已关闭共享。");return;}
   if(pausedAt){
    if(IHNativeSetForwarding(AF_INET,1)||IHNativeSetForwarding(AF_INET6,IHNativeIPv6Enabled(session)?1:0)){requestStop(@"无法恢复本会话的内核转发门控。");return;}
    atomic_store(&gateOpen,true);pausedAt=nil;if(!publish(@"running",YES))requestStop(@"无法保存VPN转发状态，已关闭共享。");
@@ -86,7 +89,7 @@ static void checkVPN(void){
  blockForwarding();
  BOOL owner=ownerValid();unsigned actualIndex=if_nametoindex([session[@"binding"][@"interface"] UTF8String]);
  if(!owner||actualIndex!=[session[@"binding"][@"interfaceIndex"] unsignedIntValue]){if(owner)authorizationFailure=@{@"check":@"interfaceIndex",@"actual":@(actualIndex),@"expected":session[@"binding"][@"interfaceIndex"]};requestStop(@"VPN已断开或共享授权失效，已阻断转发并关闭热点。");return;}
- if(!startedAt||([NSDate.date timeIntervalSinceDate:startedAt]<20&&!started))return;
+ if(!started)return;
  if(!pausedAt){pausedAt=NSDate.date;publish(@"paused",YES);}
  // 同一授权、同一隧道的配置重发只暂停转发，保留无线连接。
  // SC/路由事件及唯一的每秒检查负责恢复，避免每次事件递归排队形成轮询风暴。
@@ -128,9 +131,9 @@ static void releaseHeldRA(void){
  NSDictionary *diagnostic=IHNativeReadJSON(IH16MisdState);if(![diagnostic[@"nonce"] isEqual:session[@"nonce"]])return;
  for(NSNumber *pid in diagnostic[@"heldRA"])if(IHNativeProcess(pid.intValue,"rtadvd"))kill(pid.intValue,SIGCONT);
 }
-static BOOL stopRadioUntil(NSDate *deadline){
- if(!setRadio(NO))return NO;
- while(deadline.timeIntervalSinceNow>0&&!atomic_load(&ending)){
+static BOOL stopRadioUntil(double deadline){
+ if(IHMonotonicTime()<deadline&&!atomic_load(&ending)&&!setRadio(NO))return NO;
+ while(IHMonotonicTime()<deadline&&!atomic_load(&ending)){
   if(IH16SharingStopped())return YES;
   dispatch_semaphore_wait(readinessWake,dispatch_time(DISPATCH_TIME_NOW,100*NSEC_PER_MSEC));
  }
@@ -182,24 +185,24 @@ static void runSession(void){@autoreleasepool{
   if(ipv6){struct in6_addr address={0};arc4random_buf(address.s6_addr,8);address.s6_addr[0]=0xfd;char text[INET6_ADDRSTRLEN];inet_ntop(AF_INET6,&address,text,sizeof(text));prefix=[@(text) stringByAppendingString:@"/64"];
    NSString *wifi=prefix;address.s6_addr[7]^=1;inet_ntop(AF_INET6,&address,text,sizeof(text));NSString *usb=[@(text) stringByAppendingString:@"/64"];
    NSMutableDictionary *updated=[session mutableCopy];updated[@"prefix"]=prefix;updated[@"prefixes"]=@{@"wifi":wifi,@"usb":usb};session=updated;if(!IHNativeWriteJSON(IHNativeSessionPath,session)){failure=@"无法保存本轮IPv6前缀授权。";break;}}
-  startedAt=NSDate.date;if(!watchVPN()||(ipv6&&!serveControl())){failure=@"具名VPN事件门控或本地只读控制服务不可用。";break;}
-  NSDate *deadline=[NSDate dateWithTimeIntervalSinceNow:15];double readySince=0;startupPhase=@"waitingVPN";
+  if(!watchVPN()||(ipv6&&!serveControl())){failure=@"具名VPN事件门控或本地只读控制服务不可用。";break;}
+  double deadline=IHMonotonicTime()+15,readySince=0;startupPhase=@"waitingVPN";
   blockForwarding();if(!publish(@"waitingVPN",NO)){failure=@"无法保存VPN等待状态。";break;}
   // 上次失败或系统设置可能留下UState=开启；先确认关闭，避免重复开启成为空操作。
   if(!stopRadioUntil(deadline))break;
   BOOL settled=NO;
-  while(deadline.timeIntervalSinceNow>0&&!atomic_load(&ending)){
+  while(IHMonotonicTime()<deadline&&!atomic_load(&ending)){
    if(IHVPNStartupSettled(&readySince,IHMonotonicTime(),validVPN())){settled=YES;break;}
    dispatch_semaphore_wait(readinessWake,dispatch_time(DISPATCH_TIME_NOW,100*NSEC_PER_MSEC));
   }
-  if(!settled){failure=failure?:@"VPN服务配置未在启动期限内稳定，未开启热点。";break;}
+  if(!settled||IHMonotonicTime()>=deadline){failure=failure?:@"VPN服务配置未在启动期限内稳定，未开启热点。";break;}
   startupPhase=@"startingRadio";atomic_store(&controlActive,ipv6);if(!publish(@"startingRadio",YES)){failure=@"无法保存热点准备状态。";break;}
   // 客户端可能在显式开启前就请求了本轮共享；唯一nonce足以区分旧会话。
   NSTimeInterval requestTime=0;
-  radioRequestedAt=monotonicTime();if(!setRadio(YES))break;radioReturnedAt=monotonicTime();startupPhase=@"waitingNATAndBridge";
+  radioRequestedAt=monotonicTime();if(IHMonotonicTime()>=deadline||!setRadio(YES))break;radioReturnedAt=monotonicTime();startupPhase=@"waitingNATAndBridge";
   BOOL configured=NO,upstreamRetried=NO;
   readySince=0;
-  while(deadline.timeIntervalSinceNow>0&&!atomic_load(&ending)){
+  while(IHMonotonicTime()<deadline&&!atomic_load(&ending)){
    NSDictionary *diagnostic=IHNativeReadJSON(IH16MisdState);
    if(IHVPNStartupConfigured(diagnostic,session[@"nonce"],startupRetries+1,ipv6)){
     bridgeNames=IH16SessionBridges(session);bridgeName=bridgeNames.firstObject;
@@ -212,12 +215,12 @@ static void runSession(void){@autoreleasepool{
    if(retry){
     lastRetryReason=retry;if([retry isEqual:@"vpnUpstreamPrepared"])upstreamRetried=YES;
     startupPhase=@"restartingRadio";releaseHeldRA();if(!stopRadioUntil(deadline))break;readySince=0;settled=NO;
-    while(deadline.timeIntervalSinceNow>0&&!atomic_load(&ending)){
+    while(IHMonotonicTime()<deadline&&!atomic_load(&ending)){
      if(IHVPNStartupSettled(&readySince,IHMonotonicTime(),validVPN())){settled=YES;break;}
      dispatch_semaphore_wait(readinessWake,dispatch_time(DISPATCH_TIME_NOW,100*NSEC_PER_MSEC));
     }
-    if(!settled||!ownerValid())break;requestTime=NSDate.date.timeIntervalSince1970;startupRetries++;
-    if(!publish(@"startingRadio",YES)||!setRadio(YES))break;
+    if(!settled||IHMonotonicTime()>=deadline||!ownerValid())break;requestTime=NSDate.date.timeIntervalSince1970;startupRetries++;
+    if(!publish(@"startingRadio",YES)||IHMonotonicTime()>=deadline||!setRadio(YES))break;
     startupPhase=@"waitingNATAndBridge";
    }
    dispatch_semaphore_wait(readinessWake,dispatch_time(DISPATCH_TIME_NOW,100*NSEC_PER_MSEC));
@@ -226,9 +229,9 @@ static void runSession(void){@autoreleasepool{
   startupPhase=@"installingGateways";if(ipv6&&!ensureIPv6Gateways()){failure=@"无法安装本轮IPv6网关，未放行。";break;}
   // 网关别名安装会再次触发路由变化；在原启动期限内等门控通过，不能只试一次。
   __block BOOL opened=NO;startupPhase=@"openingGate";
-  while(!opened&&!atomic_load(&ending)&&deadline.timeIntervalSinceNow>0){
+  while(!opened&&!atomic_load(&ending)&&IHMonotonicTime()<deadline){
    dispatch_sync(watchQueue,^{
-    if(validVPN()&&!IHNativeSetForwarding(AF_INET,1)&&!IHNativeSetForwarding(AF_INET6,ipv6?1:0)){atomic_store(&gateOpen,true);started=YES;readyAt=monotonicTime();opened=publish(@"running",YES);}
+    if(IHMonotonicTime()<deadline&&validVPN()&&IHMonotonicTime()<deadline&&!IHNativeSetForwarding(AF_INET,1)&&!IHNativeSetForwarding(AF_INET6,ipv6?1:0)){atomic_store(&gateOpen,true);readyAt=monotonicTime();opened=publish(@"running",YES);if(opened)started=YES;}
     if(!opened)blockForwarding();
    });
    if(!opened)dispatch_semaphore_wait(readinessWake,dispatch_time(DISPATCH_TIME_NOW,100*NSEC_PER_MSEC));
