@@ -131,7 +131,10 @@ static void convertVPNStatus(id object,SEL selector,void *status,id rawStatus){
   }
   // 调用期间保留标记，防止同步回调递归排队；成功后继续保留准备确认。
   ((void(*)(id,SEL,id))objc_msgSend)(object,sel_registerName("processCTTetheringStatusChangeNotification:"),rawStatus);
-  updateDiagnostic(current,@{@"vpnUpstreamPrepared":@YES});
+  // 发布失败不算已完成准备，允许下一次真实CT事件重新尝试。
+  if(!updateDiagnostic(current,@{@"vpnUpstreamPrepared":@YES})){
+   @synchronized(preparedUpstreams){[preparedUpstreams removeObject:nonce];}
+  }
  }});
 }
 static BOOL installVPNUpstream(void){

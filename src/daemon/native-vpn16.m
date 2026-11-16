@@ -13,6 +13,7 @@ static NSDictionary *failureContext;
 static NSArray<NSString*> *bridgeNames;
 static NSMutableArray<NSDictionary*> *ipv6Aliases;
 static BOOL journal(void);
+static void releaseHeldRA(void);
 static double startupAt,radioRequestedAt,radioReturnedAt,readyAt;
 static double monotonicTime(void){struct timespec value;clock_gettime(CLOCK_MONOTONIC,&value);return value.tv_sec+value.tv_nsec/1e9;}
 static BOOL ensureIPv6Gateways(void){
@@ -83,7 +84,9 @@ static void checkVPN(void){
   if(IHNativeIPv6Enabled(session)&&!ensureIPv6Gateways()){requestStop(@"无法维护本轮IPv6网关，已关闭共享。");return;}
   if(pausedAt){
    if(IHNativeSetForwarding(AF_INET,1)||IHNativeSetForwarding(AF_INET6,IHNativeIPv6Enabled(session)?1:0)){requestStop(@"无法恢复本会话的内核转发门控。");return;}
-   atomic_store(&gateOpen,true);pausedAt=nil;if(!publish(@"running",YES))requestStop(@"无法保存VPN转发状态，已关闭共享。");
+   atomic_store(&gateOpen,true);pausedAt=nil;
+   if(!publish(@"running",YES))requestStop(@"无法保存VPN转发状态，已关闭共享。");
+   else if(IHNativeIPv6Enabled(session))releaseHeldRA();
   }return;
  }
  blockForwarding();
